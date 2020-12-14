@@ -37,10 +37,12 @@ BUILD_DIR = build
 # C sources
 C_SOURCES =  \
 Core/Src/adc.c \
+Core/Src/dma.c \
 Core/Src/gpio.c \
 Core/Src/hrtim.c \
 Core/Src/i2c.c \
 Core/Src/main.c \
+Core/Src/printf.c \
 Core/Src/stm32f3xx_hal_msp.c \
 Core/Src/stm32f3xx_hal_timebase_tim.c \
 Core/Src/stm32f3xx_it.c \
@@ -210,13 +212,13 @@ $(BUILD_DIR):
 # flash
 #######################################
 flash: $(BUILD_DIR)/$(TARGET).elf
-	openocd -f interface/stlink.cfg  -f target/stm32f3x.cfg -c "program $(BUILD_DIR)/$(TARGET).elf verify reset exit"
+	openocd -f interface/stlink-v2.cfg  -f target/stm32f3x.cfg -c "program $(BUILD_DIR)/$(TARGET).elf verify reset exit"
 
 #######################################
 # erase
 #######################################
 erase: $(BUILD_DIR)/$(TARGET).elf
-	openocd -f interface/stlink.cfg -f target/stm32f3x.cfg -c "init; reset halt; stm32f3x mass_erase 0; exit"
+	openocd -f interface/stlink-v2.cfg -f target/stm32f3x.cfg -c "init; reset halt; stm32f3x mass_erase 0; exit"
 
 #######################################
 # clean up

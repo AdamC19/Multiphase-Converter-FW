@@ -38,15 +38,14 @@ extern "C" {
 /* Exported types ------------------------------------------------------------*/
 /* USER CODE BEGIN ET */
 typedef enum {
-  FOUR_PHASE_INIT,
-  THREE_PHASE_INIT,
-  TWO_PHASE_INIT,
   ONE_PHASE_INIT,
-  BURST_INIT,
-  FOUR_PHASE,
-  THREE_PHASE,
-  TWO_PHASE,
+  TWO_PHASE_INIT,
+  THREE_PHASE_INIT,
+  FOUR_PHASE_INIT,
   ONE_PHASE,
+  TWO_PHASE,
+  THREE_PHASE,
+  FOUR_PHASE,
   BURST,
   OUTPUT_OFF,
   FAULT
