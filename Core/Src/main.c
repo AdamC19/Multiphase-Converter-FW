@@ -22,6 +22,7 @@
 #include "adc.h"
 #include "dma.h"
 #include "hrtim.h"
+#include "hrtim.h"
 #include "i2c.h"
 #include "usart.h"
 #include "gpio.h"
@@ -34,7 +35,6 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -46,22 +46,24 @@
 #define VREF_MV                           2500
 #define VOUT_DIV                          20
 #define VOUT_MAX_MV                       50000
-#define VOUT_SAMPLE_DEPTH                 6
+#define VOUT_SAMPLE_DEPTH                 8
 #define HRTIM_PERIOD                      0x3fff
 #define BURST_DUTY_CYCLE                  HRTIM_PERIOD/40
 #define MAX_DUTY                          ((HRTIM_PERIOD/2) - 10)
 #define MIN_DUTY                          128
 #define SHED_PHASE_THRESH                 HRTIM_PERIOD/20
-#define KP_1                              200
+#define KP_1                              25
 #define KP_2                              KP_1
 #define KP_3                              KP_1
 #define KP_4                              KP_1
-#define KI_1                              1000000
-#define VINTEG_MAX                        HRTIM_PERIOD*2*KI_1
+#define KI_1                              10000
+#define VINTEG_MAX                        HRTIM_PERIOD*KI_1
 #define KP                                30
 #define SS_SLOPE_V_PER_S                  50
-#define IOUT_SAMPLE_DEPTH                 8
+#define IOUT_SAMPLE_DEPTH                 4
 #define IPHASE_SAMPLE_DEPTH               8
+#define DEFAULT_V_SET                     12000
+#define ALLOWABLE_ERROR                   50
 
 /* gains in counts-per-A */
 #define IGAIN0                            123
@@ -98,7 +100,7 @@ volatile uint32_t vout_mv         = 0;
 volatile uint32_t vset_mv         = 0;
 volatile uint32_t target_vset_acc = 0;
 volatile int target_vset_count    = 0;
-volatile uint32_t target_vset_mv  = 0;
+volatile uint32_t target_vset_mv  = DEFAULT_V_SET;
 volatile int verr_mv              = 0;
 volatile int duty_cycle           = 0;
 volatile bool is_enabled          = false;
@@ -110,7 +112,12 @@ volatile int iout_sample_count    = 0;
 volatile uint32_t iphase_accs[4]  = {};
 volatile uint32_t iphase_meas[4]  = {};
 volatile int iphase_sample_count  = 0;
+int debug_a_size = 0;
+int debug_b_size = 0;
+int debug_buf_to_use = 0;
 uint8_t debug_buf[DEBUG_SIZE];
+uint8_t debug_buf_a[DEBUG_SIZE];
+uint8_t debug_buf_b[DEBUG_SIZE];
 
 /* USER CODE END PV */
 
@@ -457,7 +464,7 @@ void HAL_HRTIM_RepetitionEventCallback(HRTIM_HandleTypeDef * hhrtim,
       hhrtim1.Instance->sMasterRegs.MCMP4R = duty / 2; // ADC interrupt timing, halfway through first phase
       // hhrtim1.Instance->sTimerxRegs[HRTIM_TIMERINDEX_MASTER].CMP4xR = duty_cycle / 2; // ADC interrupt timing, halfway through first phase
       
-      if(duty_cycle >= HRTIM_PERIOD/4){
+      if(duty >= HRTIM_PERIOD/8){
         state = TWO_PHASE_INIT; // shift to two phases
       }
       // else if(duty_cycle < BURST_DUTY_CYCLE){
@@ -473,7 +480,7 @@ void HAL_HRTIM_RepetitionEventCallback(HRTIM_HandleTypeDef * hhrtim,
       hhrtim1.Instance->sMasterRegs.MCMP4R = duty / 2; // ADC interrupt timing, halfway through first phase
       // hhrtim1.Instance->sTimerxRegs[HRTIM_TIMERINDEX_MASTER].CMP4xR = duty / 2; // ADC interrupt timing, halfway through first phase
 
-      if(duty >= HRTIM_PERIOD/4){
+      if(duty >= HRTIM_PERIOD/8){
         state = THREE_PHASE_INIT;
       }else if(duty < SHED_PHASE_THRESH){
         // shed phase
@@ -489,7 +496,7 @@ void HAL_HRTIM_RepetitionEventCallback(HRTIM_HandleTypeDef * hhrtim,
       hhrtim1.Instance->sMasterRegs.MCMP4R = duty / 2; // ADC interrupt timing, halfway through first phase
       // hhrtim1.Instance->sTimerxRegs[HRTIM_TIMERINDEX_MASTER].CMP4xR = duty / 2; // ADC interrupt timing, halfway through first phase
       
-      if(duty >= HRTIM_PERIOD/4){
+      if(duty >= HRTIM_PERIOD/8){
         state = FOUR_PHASE_INIT;
       }else if(duty < SHED_PHASE_THRESH){
         // shed phase
@@ -528,8 +535,9 @@ void HAL_HRTIM_RepetitionEventCallback(HRTIM_HandleTypeDef * hhrtim,
     
     }case FAULT:
     case OUTPUT_OFF:{
-      duty_cycle = 0;
+      duty_cycle = MIN_DUTY;
       vset_mv = 0;
+      n_phases = 1;
       hhrtim1.Instance->sTimerxRegs[HRTIM_TIMERINDEX_MASTER].CMP4xR = HRTIM_PERIOD / 2; // ADC interrupt timing, halfway through first phase
       HAL_HRTIM_WaveformOutputStop(&hhrtim1, HRTIM_OUTPUT_TA1 | HRTIM_OUTPUT_TB1 | HRTIM_OUTPUT_TC1 | HRTIM_OUTPUT_TD1);
     }
@@ -593,6 +601,7 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc){
       iphase_sample_count++;
     }
     
+    /*
     target_vset_acc += adc2_converted_values[4];
     target_vset_count++;
 
@@ -602,170 +611,13 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc){
       target_vset_acc = 0;
       target_vset_count = 0;
     }
+    */
 
     // calculate the target setpoint
     
     
   }
   // LED_off(1);
-}
-
-/**
- * @brief transitions to a new state
- */
-void goto_state(uint8_t next_state){
-  LED_on(1);
-  // snprintf(debug_buf, DEBUG_SIZE, "Going to state %d\r\n", next_state);
-  // debug(debug_buf);
-  switch(next_state){
-    case ONE_PHASE_INIT:{
-      n_phases = 1;
-      kp = KP_1;
-      memset(iphase_accs, 0, sizeof(uint32_t) * n_phases); // phase current accumulator reset
-      iphase_sample_count = 0;
-      HAL_HRTIM_WaveformOutputStop(&hhrtim1, HRTIM_OUTPUT_TB1 | HRTIM_OUTPUT_TC1 | HRTIM_OUTPUT_TD1);
-      hhrtim1.Instance->sTimerxRegs[HRTIM_TIMERINDEX_TIMER_A].CMP1xR = duty_cycle;
-      hhrtim1.Instance->sMasterRegs.MCMP4R = duty_cycle / 2; // ADC interrupt timing, halfway through first phase
-      // hhrtim1.Instance->sTimerxRegs[HRTIM_TIMERINDEX_MASTER].CMP4xR = duty_cycle / 2; // ADC interrupt timing, halfway through first phase
-      HAL_HRTIM_WaveformOutputStart(&hhrtim1, HRTIM_OUTPUT_TA1);
-      // HAL_HRTIM_WaveformCountStart(&hhrtim1, HRTIM_TIMERID_TIMER_A);
-      break;
-    }case TWO_PHASE_INIT:{
-      n_phases = 2;
-      kp = KP_2;
-      memset(iphase_accs, 0, sizeof(uint32_t) * n_phases); // phase current accumulator reset
-      iphase_sample_count = 0;
-      HAL_HRTIM_WaveformOutputStop(&hhrtim1, HRTIM_OUTPUT_TC1 | HRTIM_OUTPUT_TD1);
-      hhrtim1.Instance->sMasterRegs.MCMP1R = HRTIM_PERIOD / 2; // interrupt to set second phase
-      uint32_t duty = duty_cycle / 2;
-      hhrtim1.Instance->sMasterRegs.MCMP4R = duty_cycle / 2; // ADC interrupt timing, halfway through first phase
-      // hhrtim1.Instance->sTimerxRegs[HRTIM_TIMERINDEX_MASTER].CMP4xR = duty / 2; // ADC interrupt timing, halfway through first phase
-      hhrtim1.Instance->sTimerxRegs[HRTIM_TIMERINDEX_TIMER_A].CMP1xR = duty;
-      hhrtim1.Instance->sTimerxRegs[HRTIM_TIMERINDEX_TIMER_B].CMP1xR = duty;
-      HAL_HRTIM_WaveformOutputStart(&hhrtim1, HRTIM_OUTPUT_TA1 | HRTIM_OUTPUT_TB1);
-      // HAL_HRTIM_WaveformCountStart(&hhrtim1, HRTIM_TIMERID_TIMER_A | HRTIM_TIMERID_TIMER_B);
-      break;
-    }case THREE_PHASE_INIT:{
-      n_phases = 3;
-      kp = KP_3;
-      memset(iphase_accs, 0, sizeof(uint32_t) * n_phases); // phase current accumulator reset
-      iphase_sample_count = 0;
-      HAL_HRTIM_WaveformOutputStop(&hhrtim1, HRTIM_OUTPUT_TD1);
-      hhrtim1.Instance->sMasterRegs.MCMP1R = HRTIM_PERIOD / 3; // interrupt to set second phase
-      hhrtim1.Instance->sMasterRegs.MCMP2R = 2 * (HRTIM_PERIOD / 3); // interrupt to set third phase
-      uint32_t duty = duty_cycle / 3;
-      hhrtim1.Instance->sMasterRegs.MCMP4R = duty_cycle / 2; // ADC interrupt timing, halfway through first phase
-      // hhrtim1.Instance->sTimerxRegs[HRTIM_TIMERINDEX_MASTER].CMP4xR = duty / 2; // ADC interrupt timing, halfway through first phase
-      hhrtim1.Instance->sTimerxRegs[HRTIM_TIMERINDEX_TIMER_A].CMP1xR = duty;
-      hhrtim1.Instance->sTimerxRegs[HRTIM_TIMERINDEX_TIMER_B].CMP1xR = duty;
-      hhrtim1.Instance->sTimerxRegs[HRTIM_TIMERINDEX_TIMER_C].CMP1xR = duty;
-      HAL_HRTIM_WaveformOutputStart(&hhrtim1, HRTIM_OUTPUT_TA1 | HRTIM_OUTPUT_TB1 |  HRTIM_OUTPUT_TC1);
-      // HAL_HRTIM_WaveformCountStart(&hhrtim1, HRTIM_TIMERID_TIMER_A | HRTIM_TIMERID_TIMER_B | HRTIM_TIMERID_TIMER_C);
-      break;
-    }case FOUR_PHASE_INIT:{
-      n_phases = 4;
-      kp = KP_4;
-      memset(iphase_accs, 0, sizeof(uint32_t) * n_phases); // phase current accumulator reset
-      iphase_sample_count = 0;
-      hhrtim1.Instance->sMasterRegs.MCMP1R = HRTIM_PERIOD / 4; // interrupt to set second phase
-      hhrtim1.Instance->sMasterRegs.MCMP2R = 2 * (HRTIM_PERIOD / 4); // interrupt to set third phase
-      hhrtim1.Instance->sMasterRegs.MCMP2R = 3 * (HRTIM_PERIOD / 4); // interrupt to set fourth phase
-      uint32_t duty = duty_cycle / 4;
-      hhrtim1.Instance->sMasterRegs.MCMP4R = duty_cycle / 2; // ADC interrupt timing, halfway through first phase
-      // hhrtim1.Instance->sTimerxRegs[HRTIM_TIMERINDEX_MASTER].CMP4xR = duty / 2; // ADC interrupt timing, halfway through first phase
-      hhrtim1.Instance->sTimerxRegs[HRTIM_TIMERINDEX_TIMER_A].CMP1xR = duty;
-      hhrtim1.Instance->sTimerxRegs[HRTIM_TIMERINDEX_TIMER_B].CMP1xR = duty;
-      hhrtim1.Instance->sTimerxRegs[HRTIM_TIMERINDEX_TIMER_C].CMP1xR = duty;
-      hhrtim1.Instance->sTimerxRegs[HRTIM_TIMERINDEX_TIMER_D].CMP1xR = duty;
-      HAL_HRTIM_WaveformOutputStart(&hhrtim1, HRTIM_OUTPUT_TA1 | HRTIM_OUTPUT_TB1 |  HRTIM_OUTPUT_TC1 | HRTIM_OUTPUT_TD1);
-      // HAL_HRTIM_WaveformCountStart(&hhrtim1, HRTIM_TIMERID_TIMER_A | HRTIM_TIMERID_TIMER_B | HRTIM_TIMERID_TIMER_C | HRTIM_TIMERID_TIMER_D);
-      break;
-    }case ONE_PHASE:{
-      n_phases = 1;
-      kp = KP_1;
-      memset(iphase_accs, 0, sizeof(uint32_t) * n_phases);
-      iphase_sample_count = 0;
-      HAL_HRTIM_WaveformOutputStop(&hhrtim1, HRTIM_OUTPUT_TB1 | HRTIM_OUTPUT_TC1 | HRTIM_OUTPUT_TD1);
-      hhrtim1.Instance->sMasterRegs.MCMP4R = duty_cycle / 2; // ADC interrupt timing, halfway through first phase
-      // hhrtim1.Instance->sTimerxRegs[HRTIM_TIMERINDEX_MASTER].CMP4xR = duty_cycle / 2; // ADC interrupt timing, halfway through first phase
-      hhrtim1.Instance->sTimerxRegs[HRTIM_TIMERINDEX_TIMER_A].CMP1xR = duty_cycle;
-      HAL_HRTIM_WaveformOutputStart(&hhrtim1, HRTIM_OUTPUT_TA1);
-      // HAL_HRTIM_WaveformCountStart(&hhrtim1, HRTIM_TIMERID_TIMER_A);
-      break;
-    }case TWO_PHASE:{
-      n_phases = 2;
-      kp = KP_2;
-      memset(iphase_accs, 0, sizeof(uint32_t) * n_phases);
-      iphase_sample_count = 0;
-      HAL_HRTIM_WaveformOutputStop(&hhrtim1, HRTIM_OUTPUT_TC1 | HRTIM_OUTPUT_TD1);
-      hhrtim1.Instance->sMasterRegs.MCMP1R = HRTIM_PERIOD / 2; // interrupt to set second phase
-      uint32_t duty = duty_cycle / 2;
-      hhrtim1.Instance->sMasterRegs.MCMP4R = duty / 2; // ADC interrupt timing, halfway through first phase
-      // hhrtim1.Instance->sTimerxRegs[HRTIM_TIMERINDEX_MASTER].CMP4xR = duty / 2; // ADC interrupt timing, halfway through first phase
-      hhrtim1.Instance->sTimerxRegs[HRTIM_TIMERINDEX_TIMER_A].CMP1xR = duty;
-      hhrtim1.Instance->sTimerxRegs[HRTIM_TIMERINDEX_TIMER_B].CMP1xR = duty;
-      HAL_HRTIM_WaveformOutputStart(&hhrtim1, HRTIM_OUTPUT_TA1 | HRTIM_OUTPUT_TB1);
-      // HAL_HRTIM_WaveformCountStart(&hhrtim1, HRTIM_TIMERID_TIMER_A | HRTIM_TIMERID_TIMER_B);
-      break;
-    }case THREE_PHASE:{
-      n_phases = 3;
-      kp = KP_3;
-      memset(iphase_accs, 0, sizeof(uint32_t) * n_phases);
-      iphase_sample_count = 0;
-      HAL_HRTIM_WaveformOutputStop(&hhrtim1, HRTIM_OUTPUT_TD1);
-      hhrtim1.Instance->sMasterRegs.MCMP1R = HRTIM_PERIOD / 3; // interrupt to set second phase
-      hhrtim1.Instance->sMasterRegs.MCMP2R = 2 * (HRTIM_PERIOD / 3); // interrupt to set third phase
-      uint32_t duty = duty_cycle / 3;
-      hhrtim1.Instance->sMasterRegs.MCMP4R = duty / 2; // ADC interrupt timing, halfway through first phase
-      // hhrtim1.Instance->sTimerxRegs[HRTIM_TIMERINDEX_MASTER].CMP4xR = duty / 2; // ADC interrupt timing, halfway through first phase
-      hhrtim1.Instance->sTimerxRegs[HRTIM_TIMERINDEX_TIMER_A].CMP1xR = duty;
-      hhrtim1.Instance->sTimerxRegs[HRTIM_TIMERINDEX_TIMER_B].CMP1xR = duty;
-      hhrtim1.Instance->sTimerxRegs[HRTIM_TIMERINDEX_TIMER_C].CMP1xR = duty;
-      HAL_HRTIM_WaveformOutputStart(&hhrtim1, HRTIM_OUTPUT_TA1 | HRTIM_OUTPUT_TB1 |  HRTIM_OUTPUT_TC1);
-      // HAL_HRTIM_WaveformCountStart(&hhrtim1, HRTIM_TIMERID_TIMER_A | HRTIM_TIMERID_TIMER_B | HRTIM_TIMERID_TIMER_C);
-      break;
-    }case FOUR_PHASE:{
-      n_phases = 4;
-      kp = KP_4;
-      memset(iphase_accs, 0, sizeof(uint32_t) * n_phases); // phase current accumulator reset
-      iphase_sample_count = 0;
-      hhrtim1.Instance->sMasterRegs.MCMP1R = HRTIM_PERIOD / 4; // interrupt to set second phase
-      hhrtim1.Instance->sMasterRegs.MCMP2R = 2 * (HRTIM_PERIOD / 4); // interrupt to set third phase
-      hhrtim1.Instance->sMasterRegs.MCMP2R = 3 * (HRTIM_PERIOD / 4); // interrupt to set fourth phase
-      uint32_t duty = duty_cycle / 4;
-      hhrtim1.Instance->sMasterRegs.MCMP4R = duty / 2; // ADC interrupt timing, halfway through first phase
-      // hhrtim1.Instance->sTimerxRegs[HRTIM_TIMERINDEX_MASTER].CMP4xR = duty / 2; // ADC interrupt timing, halfway through first phase
-      hhrtim1.Instance->sTimerxRegs[HRTIM_TIMERINDEX_TIMER_A].CMP1xR = duty;
-      hhrtim1.Instance->sTimerxRegs[HRTIM_TIMERINDEX_TIMER_B].CMP1xR = duty;
-      hhrtim1.Instance->sTimerxRegs[HRTIM_TIMERINDEX_TIMER_C].CMP1xR = duty;
-      hhrtim1.Instance->sTimerxRegs[HRTIM_TIMERINDEX_TIMER_D].CMP1xR = duty;
-      HAL_HRTIM_WaveformOutputStart(&hhrtim1, HRTIM_OUTPUT_TA1 | HRTIM_OUTPUT_TB1 |  HRTIM_OUTPUT_TC1 | HRTIM_OUTPUT_TD1);
-      // HAL_HRTIM_WaveformCountStart(&hhrtim1, HRTIM_TIMERID_TIMER_A | HRTIM_TIMERID_TIMER_B | HRTIM_TIMERID_TIMER_C | HRTIM_TIMERID_TIMER_D);
-      break;
-    }case BURST:{
-      n_phases = 1;
-      kp = KP_1;
-      memset(iphase_accs, 0, sizeof(uint32_t) * n_phases); // phase current accumulator reset
-      iphase_sample_count = 0;
-      HAL_HRTIM_WaveformOutputStop(&hhrtim1, HRTIM_OUTPUT_TB1 | HRTIM_OUTPUT_TC1 | HRTIM_OUTPUT_TD1);
-      hhrtim1.Instance->sTimerxRegs[HRTIM_TIMERINDEX_TIMER_A].CMP1xR = BURST_DUTY_CYCLE;
-      hhrtim1.Instance->sTimerxRegs[HRTIM_TIMERINDEX_MASTER].CMP4xR = BURST_DUTY_CYCLE / 2; // ADC interrupt timing, halfway through first phase
-      HAL_HRTIM_WaveformOutputStart(&hhrtim1, HRTIM_OUTPUT_TA1);
-      break;
-    }case OUTPUT_OFF:{
-      duty_cycle = 0;
-      vset_mv = 0;
-      hhrtim1.Instance->sTimerxRegs[HRTIM_TIMERINDEX_MASTER].CMP4xR = HRTIM_PERIOD / 2; // ADC interrupt timing, halfway through first phase
-      HAL_HRTIM_WaveformOutputStop(&hhrtim1, HRTIM_OUTPUT_TA1 | HRTIM_OUTPUT_TB1 | HRTIM_OUTPUT_TC1 | HRTIM_OUTPUT_TD1);
-      break;
-    }case FAULT:{
-
-      break;
-    }default:
-      break;
-  };
-  LED_off(1);
-  state = next_state;
 }
 
 
@@ -801,10 +653,13 @@ void set_i_gain(uint8_t setting){
 void refactor_duty_cycle(){
   // PI-esque feedback loop
   verr_mv = (int)vset_mv - (int)vout_mv;
+  if(abs(verr_mv) < ALLOWABLE_ERROR){
+    return;
+  }
   vinteg += verr_mv;
-  vinteg = CLAMP(vinteg, -VINTEG_MAX, VINTEG_MAX);
+  vinteg = CLAMP(vinteg, -MAX_DUTY*n_phases*ki, MAX_DUTY*n_phases*ki);
   duty_cycle = (verr_mv / kp) + vinteg / ki;
-  duty_cycle = CLAMP(duty_cycle, MIN_DUTY, 2*HRTIM_PERIOD);
+  duty_cycle = CLAMP(duty_cycle, MIN_DUTY*n_phases, MAX_DUTY*n_phases);
 }
 
 void add_sample(uint32_t sample, uint32_t* buf, int* sample_ind, int depth){
@@ -893,13 +748,56 @@ switch (led)
   }
 }
 
+
 void debug(char* str){
-  HAL_UART_Transmit(&huart2, str, strlen(str), 10);
+  int len = strlen(str);
+
+  if(debug_buf_to_use == 0){
+    if(debug_a_size + len > DEBUG_SIZE){
+      len = DEBUG_SIZE - debug_a_size; // max allowable length to append
+    }
+    memcpy(debug_buf_a + debug_a_size, str, len); // store new data
+    debug_a_size += len;
+
+    if(huart2.gState == HAL_UART_STATE_READY){
+      debug_buf_to_use = 1;
+      HAL_UART_Transmit_IT(&huart2, debug_buf_a, debug_a_size);
+      debug_a_size = 0;
+    }
+
+
+  }else{
+    if(debug_b_size + len > DEBUG_SIZE){
+      len = DEBUG_SIZE - debug_b_size; // max allowable length to append
+    }
+    memcpy(debug_buf_b + debug_b_size, str, len); // store new data
+    debug_b_size += len;
+
+    if(huart2.gState == HAL_UART_STATE_READY){
+      debug_buf_to_use = 0;
+      HAL_UART_Transmit_IT(&huart2, debug_buf_b, debug_b_size);
+      debug_b_size = 0;
+    }
+  }
+  
+  
+}
+
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart){
+  if(debug_buf_to_use == 0 && debug_a_size > 0){
+    debug_buf_to_use = 1; // indicate that buffer B should be filled while we send out buffer A
+    HAL_UART_Transmit_IT(&huart2, debug_buf_a, debug_a_size); // transmit buffer a
+    debug_a_size = 0;
+  }else if(debug_buf_to_use == 1 && debug_b_size > 0){
+    debug_buf_to_use = 0; // indicate that buffer A should be filled while we send out buffer B
+    HAL_UART_Transmit_IT(&huart2, debug_buf_b, debug_b_size); // transmit buffer b
+    debug_b_size = 0;
+  }
 }
 
 /* USER CODE END 4 */
 
-/**
+ /**
   * @brief  Period elapsed callback in non blocking mode
   * @note   This function is called  when TIM1 interrupt took place, inside
   * HAL_TIM_IRQHandler(). It makes a direct call to HAL_IncTick() to increment
