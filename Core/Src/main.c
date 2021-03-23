@@ -46,30 +46,43 @@
 #define VREF_MV                           2500
 #define VOUT_DIV                          20
 #define VOUT_MAX_MV                       50000
-#define VOUT_SAMPLE_DEPTH                 8
+#define VOUT_SAMPLE_DEPTH                 4
 #define HRTIM_PERIOD                      0x3fff
 #define BURST_DUTY_CYCLE                  HRTIM_PERIOD/40
 #define MAX_DUTY                          ((HRTIM_PERIOD/2) - 10)
 #define MIN_DUTY                          128
+#define ADD_PHASE_THRESH                  HRTIM_PERIOD/8
+#define ADD_PHASE_CURR_THRESH             2000
 #define SHED_PHASE_THRESH                 HRTIM_PERIOD/20
-#define KP_1                              25
+#define SHED_PHASE_CURR_THRESH            1500
+#define KP_1                              4
 #define KP_2                              KP_1
 #define KP_3                              KP_1
 #define KP_4                              KP_1
-#define KI_1                              10000
+#define KP_LIGHT_LOAD                     100
+#define KI_1                              250
+#define KI_LIGHT_LOAD                     25000
+#define KD_1                              2
 #define VINTEG_MAX                        HRTIM_PERIOD*KI_1
 #define KP                                30
 #define SS_SLOPE_V_PER_S                  50
-#define IOUT_SAMPLE_DEPTH                 4
+#define IOUT_SAMPLE_DEPTH                 8
 #define IPHASE_SAMPLE_DEPTH               8
 #define DEFAULT_V_SET                     12000
-#define ALLOWABLE_ERROR                   50
+#define ALLOWABLE_ERROR                   10
+
+#define VERR_RUNNING_MEAN_SIZE            4
+
+#define I2C_DATA_SIZE                     8
+#define I2C_CMD_SET_VOUT                  0x01
+#define I2C_CMD_ENABLE_OUTPUT             0x02
+#define I2C_CMD_DISABLE_OUTPUT            0x03
 
 /* gains in counts-per-A */
-#define IGAIN0                            123
-#define IGAIN1                            246
-#define IGAIN2                            492
-#define IGAIN3                            3686
+#define IGAIN3                            123
+#define IGAIN2                            246
+#define IGAIN1                            492
+#define IGAIN0                            3686
 
 #define CLAMP(x, a, b)                    (x < a ? a : (x > b ? b : x))
 
@@ -92,9 +105,14 @@ volatile int n_phases             = 1; // number of phases enabled
 uint32_t vout_sample_buf[VOUT_SAMPLE_DEPTH];
 volatile int kp                   = KP_1;
 volatile int ki                   = KI_1;
+volatile int kd                   = KD_1;
 volatile int vinteg               = 0;
+volatile int vdelta               = 0;
 volatile int vout_sample_ind      = 0;
 volatile uint32_t vout_sample_acc = 0;
+volatile int verr_acc             = 0;
+volatile uint32_t verr_history[VERR_RUNNING_MEAN_SIZE] = {};
+volatile int verr_rm_ind          = 0;
 volatile uint32_t vout_offset_mv  = 2000;
 volatile uint32_t vout_mv         = 0;
 volatile uint32_t vset_mv         = 0;
@@ -107,6 +125,7 @@ volatile bool is_enabled          = false;
 volatile int i_gain_setting       = 0; // 0 thru 3
 volatile uint32_t i_gain          = 0; // i sense gain in counts-per-A
 volatile uint32_t iout_ma         = 0;
+volatile uint32_t iout_offset_ma  = 0;
 volatile uint32_t iout_sample_acc = 0;
 volatile int iout_sample_count    = 0;
 volatile uint32_t iphase_accs[4]  = {};
@@ -118,6 +137,9 @@ int debug_buf_to_use = 0;
 uint8_t debug_buf[DEBUG_SIZE];
 uint8_t debug_buf_a[DEBUG_SIZE];
 uint8_t debug_buf_b[DEBUG_SIZE];
+volatile bool i2c_enabled_status = false;
+volatile bool i2c_cmd_rcvd = false;
+uint8_t i2c_data[I2C_DATA_SIZE];
 
 /* USER CODE END PV */
 
@@ -183,6 +205,8 @@ int main(void)
   /* USER CODE BEGIN 2 */
 
   state = START_STATE;
+  i_gain_setting = 0;
+  set_i_gain(i_gain_setting);
 
   /* ------------ */
   /* ADC start-up */
@@ -203,8 +227,6 @@ int main(void)
   HAL_ADC_Start_DMA(&hadc2, adc2_converted_values, ADC2_CONVERTEDVALUES_BUFFER_SIZE);
   HAL_ADC_Start(&hadc2);
 
-  set_i_gain(3); // most sensetive setting
-
   /* -------------- */
   /* HRTIM start-up */
   /* -------------- */
@@ -213,6 +235,11 @@ int main(void)
 
   // start timer master, A, B, C, D
   HAL_HRTIM_WaveformCountStart_IT(&hhrtim1, HRTIM_TIMERID_MASTER | HRTIM_TIMERID_TIMER_A | HRTIM_TIMERID_TIMER_B | HRTIM_TIMERID_TIMER_C | HRTIM_TIMERID_TIMER_D);
+
+  /* ------------------ */
+  /* I2C Slave start-up */
+  /* ------------------ */
+  HAL_I2C_Slave_Receive_IT(&hi2c1, i2c_data, 1); // receive a 1-byte command
 
   /* USER CODE END 2 */
 
@@ -292,14 +319,14 @@ int main(void)
     // DEBUG OUTPUT
     if(HAL_GetTick()/250 % 2 == 0){
       if(status_update){
-        snprintf(debug_buf, DEBUG_SIZE, "Vout(mV): %d;\t", vout_mv);
+        snprintf(debug_buf, DEBUG_SIZE, "V:%6d; Vset:%6d; Target:%6d; Ph:%2d; I:%6d\r\n", vout_mv, vset_mv, target_vset_mv, n_phases, iout_ma);
         debug(debug_buf);
-        snprintf(debug_buf, DEBUG_SIZE, "Vset(mV): %d;\t",vset_mv);
-        debug(debug_buf);
-        snprintf(debug_buf, DEBUG_SIZE, "Target: %d;\t", target_vset_mv);
-        debug(debug_buf);
-        snprintf(debug_buf, DEBUG_SIZE, "Phases: %d\r\n", n_phases);
-        debug(debug_buf);
+        // snprintf(debug_buf, DEBUG_SIZE, "Vset: %d;\t",vset_mv);
+        // debug(debug_buf);
+        // snprintf(debug_buf, DEBUG_SIZE, "Target: %d;\t", target_vset_mv);
+        // debug(debug_buf);
+        // snprintf(debug_buf, DEBUG_SIZE, "Ph: %d\r\n", n_phases);
+        // debug(debug_buf);
         status_update = false;
       }
     }else{
@@ -383,13 +410,13 @@ void HAL_HRTIM_RepetitionEventCallback(HRTIM_HandleTypeDef * hhrtim,
     }
 
     uint32_t duty = 0; // duty cycle per phase
-    if(n_phases > 0){
-      duty = duty_cycle / n_phases;
-    }else{
-      duty = duty_cycle;
-    }
+    // if(n_phases > 0){
+    //   duty = duty_cycle / n_phases;
+    // }else{
+    //   duty = duty_cycle;
+    // }
     // clamp per-phase duty cycle
-    duty = CLAMP(duty, MIN_DUTY, MAX_DUTY);
+    duty = CLAMP(duty_cycle, MIN_DUTY, MAX_DUTY);
 
     // BEGIN STATE MACHINE
     switch (state)
@@ -464,11 +491,16 @@ void HAL_HRTIM_RepetitionEventCallback(HRTIM_HandleTypeDef * hhrtim,
       hhrtim1.Instance->sMasterRegs.MCMP4R = duty / 2; // ADC interrupt timing, halfway through first phase
       // hhrtim1.Instance->sTimerxRegs[HRTIM_TIMERINDEX_MASTER].CMP4xR = duty_cycle / 2; // ADC interrupt timing, halfway through first phase
       
-      if(duty >= HRTIM_PERIOD/8){
+      if(iout_ma >= ADD_PHASE_CURR_THRESH){
         state = TWO_PHASE_INIT; // shift to two phases
       }
-      // else if(duty_cycle < BURST_DUTY_CYCLE){
-      //   goto_state(BURST); // very light load, shift to burst mode
+      // else if(iout_ma < 80){
+      //   kp = KP_LIGHT_LOAD;
+      //   ki = KI_LIGHT_LOAD;
+      //   // state = BURST; // very light load, shift to burst mode
+      // }else if(iout_ma > 100){
+      //   kp = KP_1;
+      //   ki = KI_1;
       // }
 
       break;
@@ -480,9 +512,9 @@ void HAL_HRTIM_RepetitionEventCallback(HRTIM_HandleTypeDef * hhrtim,
       hhrtim1.Instance->sMasterRegs.MCMP4R = duty / 2; // ADC interrupt timing, halfway through first phase
       // hhrtim1.Instance->sTimerxRegs[HRTIM_TIMERINDEX_MASTER].CMP4xR = duty / 2; // ADC interrupt timing, halfway through first phase
 
-      if(duty >= HRTIM_PERIOD/8){
+      if(iout_ma >= 2*ADD_PHASE_CURR_THRESH){
         state = THREE_PHASE_INIT;
-      }else if(duty < SHED_PHASE_THRESH){
+      }else if(iout_ma < 2*SHED_PHASE_CURR_THRESH){
         // shed phase
         state = ONE_PHASE_INIT;
       }
@@ -496,9 +528,9 @@ void HAL_HRTIM_RepetitionEventCallback(HRTIM_HandleTypeDef * hhrtim,
       hhrtim1.Instance->sMasterRegs.MCMP4R = duty / 2; // ADC interrupt timing, halfway through first phase
       // hhrtim1.Instance->sTimerxRegs[HRTIM_TIMERINDEX_MASTER].CMP4xR = duty / 2; // ADC interrupt timing, halfway through first phase
       
-      if(duty >= HRTIM_PERIOD/8){
+      if(iout_ma >= 3*ADD_PHASE_CURR_THRESH){
         state = FOUR_PHASE_INIT;
-      }else if(duty < SHED_PHASE_THRESH){
+      }else if(iout_ma < 3*SHED_PHASE_CURR_THRESH){
         // shed phase
         state = TWO_PHASE_INIT;
       }
@@ -513,7 +545,7 @@ void HAL_HRTIM_RepetitionEventCallback(HRTIM_HandleTypeDef * hhrtim,
       hhrtim1.Instance->sMasterRegs.MCMP4R = duty / 2; // ADC interrupt timing, halfway through first phase
       // hhrtim1.Instance->sTimerxRegs[HRTIM_TIMERINDEX_MASTER].CMP4xR = duty / 2; // ADC interrupt timing, halfway through first phase
 
-      if(duty < SHED_PHASE_THRESH){
+      if(iout_ma < 4*SHED_PHASE_CURR_THRESH){
         // shed phase
         state = THREE_PHASE_INIT;
       }
@@ -522,24 +554,25 @@ void HAL_HRTIM_RepetitionEventCallback(HRTIM_HandleTypeDef * hhrtim,
     }case BURST:{
       break;
       verr_mv = vset_mv - vout_mv;
-      if(verr_mv > 50){
+      if(abs(verr_mv) > 2*ALLOWABLE_ERROR){
         // 50mV or more below setpoint, likely dropping out of regulation, so switch to single phase
         state = ONE_PHASE_INIT;
-      }else if(verr_mv > 25){
+      }else if(verr_mv > ALLOWABLE_ERROR){
         // less than 50mV but more than 25mV below setpoint, so turn on phase
         hhrtim1.Instance->sTimerxRegs[HRTIM_TIMERINDEX_TIMER_A].CMP1xR = BURST_DUTY_CYCLE;
-      }else if(verr_mv < -25){
+      }else if(verr_mv < -ALLOWABLE_ERROR){
         // 25mV or more above setpoint, turn off phase
-        hhrtim1.Instance->sTimerxRegs[HRTIM_TIMERINDEX_TIMER_A].CMP1xR = 0;
+        hhrtim1.Instance->sTimerxRegs[HRTIM_TIMERINDEX_TIMER_A].CMP1xR = MIN_DUTY;
       }
-    
+      // break;
     }case FAULT:
     case OUTPUT_OFF:{
       duty_cycle = MIN_DUTY;
       vset_mv = 0;
-      n_phases = 1;
+      n_phases = 0;
       hhrtim1.Instance->sTimerxRegs[HRTIM_TIMERINDEX_MASTER].CMP4xR = HRTIM_PERIOD / 2; // ADC interrupt timing, halfway through first phase
       HAL_HRTIM_WaveformOutputStop(&hhrtim1, HRTIM_OUTPUT_TA1 | HRTIM_OUTPUT_TB1 | HRTIM_OUTPUT_TC1 | HRTIM_OUTPUT_TD1);
+      break;
     }
     default:{
       // this will catch the FAULT state too
@@ -566,8 +599,24 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc){
     iout_sample_acc += adc1_converted_values[1];
     iout_sample_count++;
     if(iout_sample_count >= IOUT_SAMPLE_DEPTH){
-      iout_ma = (1000 * iout_sample_acc) / (i_gain * iout_sample_count);
+      uint32_t iout_adc_value = iout_sample_acc / iout_sample_count;
+      iout_ma = (1000 * iout_adc_value) / (i_gain);
+      iout_ma -= iout_offset_ma;
+      if(iout_adc_value >= 3890){
+        // greater than 95% of full scale, shift to less sensitive gain setting if possible
+        if(i_gain_setting < 3){
+          i_gain_setting += 1;
+          set_i_gain(i_gain_setting);
+        }
+      }else if(iout_adc_value < 205){
+        // less than 5% of full scale, shift to more sensetive gain setting if possible
+        if(i_gain_setting > 0){
+          i_gain_setting -= 1;
+          set_i_gain(i_gain_setting);
+        }
+      }
       iout_sample_count = 0;
+      iout_sample_acc = 0;
     }
 
     // add voltage measurment
@@ -642,23 +691,30 @@ void set_i_gain(uint8_t setting){
       break;
   };
 
-  i_gain_setting = setting;
-
-  HAL_GPIO_WritePin(IMUX_0_GPIO_Port, IMUX_0_Pin, i_gain_setting & 1);
-  HAL_GPIO_WritePin(IMUX_1_GPIO_Port, IMUX_1_Pin, (i_gain_setting >> 1) & 1);
-  HAL_GPIO_WritePin(IMUX_2_GPIO_Port, IMUX_2_Pin, (i_gain_setting >> 2) & 1);
+  HAL_GPIO_WritePin(IMUX_0_GPIO_Port, IMUX_0_Pin, setting & 1);
+  HAL_GPIO_WritePin(IMUX_1_GPIO_Port, IMUX_1_Pin, (setting >> 1) & 1);
+  HAL_GPIO_WritePin(IMUX_2_GPIO_Port, IMUX_2_Pin, (setting >> 2) & 1);
 
 }
 
 void refactor_duty_cycle(){
   // PI-esque feedback loop
   verr_mv = (int)vset_mv - (int)vout_mv;
+  // verr_history[verr_rm_ind++] = verr_mv;
+  // if(verr_rm_ind >= VERR_RUNNING_MEAN_SIZE){
+  //   vdelta = 0;
+  //   int verr_mean = verr_acc / verr_rm_ind;
+  //   for(int i = 0; i < verr_rm_ind - 1; i++){
+  //     vdelta += verr_history[i + 1] - verr_history[i];
+  //   }
+  //   verr_rm_ind = 0;
+  // }
   if(abs(verr_mv) < ALLOWABLE_ERROR){
     return;
   }
   vinteg += verr_mv;
-  vinteg = CLAMP(vinteg, -MAX_DUTY*n_phases*ki, MAX_DUTY*n_phases*ki);
-  duty_cycle = (verr_mv / kp) + vinteg / ki;
+  vinteg = CLAMP(vinteg, -MAX_DUTY*ki, MAX_DUTY*ki);
+  duty_cycle = (verr_mv * kp) + vinteg / ki;// + vdelta / kd;
   duty_cycle = CLAMP(duty_cycle, MIN_DUTY*n_phases, MAX_DUTY*n_phases);
 }
 
@@ -793,6 +849,44 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart){
     HAL_UART_Transmit_IT(&huart2, debug_buf_b, debug_b_size); // transmit buffer b
     debug_b_size = 0;
   }
+}
+
+void HAL_I2C_SlaveRxCpltCallback(I2C_HandleTypeDef *hi2c){
+  // do I2C data reception things
+  debug("I2C\r\n");
+  switch(i2c_data[0]){
+    case I2C_CMD_SET_VOUT:{
+      if(!i2c_cmd_rcvd){
+        // we received the command byte just now
+        i2c_cmd_rcvd = true;
+        // next we expect to receive the data
+        HAL_I2C_Slave_Receive_IT(&hi2c1, i2c_data + 1, sizeof(int));
+      }else{
+        // we just received the data
+        int new_vout = 0;
+        new_vout |= i2c_data[1] << 24;
+        new_vout |= i2c_data[2] << 16;
+        new_vout |= i2c_data[3] << 8;
+        new_vout |= i2c_data[4];
+        target_vset_mv = CLAMP(new_vout, 0, VOUT_MAX_MV);
+        i2c_cmd_rcvd = false;
+        HAL_I2C_Slave_Receive_IT(&hi2c1, i2c_data, 1); // wait for a command byte
+      }
+      break;
+    }case I2C_CMD_ENABLE_OUTPUT:{
+      i2c_enabled_status = true;
+      HAL_I2C_Slave_Receive_IT(&hi2c1, i2c_data, 1); // wait for a command byte
+      break;
+    }case I2C_CMD_DISABLE_OUTPUT:{
+      i2c_enabled_status = false;
+      HAL_I2C_Slave_Receive_IT(&hi2c1, i2c_data, 1); // wait for a command byte
+      break;
+    }default:{
+      HAL_I2C_Slave_Receive_IT(&hi2c1, i2c_data, 1); // wait for a command byte
+      break;
+    }
+  };
+  
 }
 
 /* USER CODE END 4 */
